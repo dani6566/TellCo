@@ -1,9 +1,11 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+import seaborn as sns
 from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
 from load_data import load_data_from_postgres
+from utils import OverviewAnalysis
 
 
 
@@ -23,86 +25,130 @@ def load_data():
         print("Failed to load data.")
     return df
 
+
+
+
+# Load dataset
 df = load_data()
 
-print(df.head())
+# Dashboard title
+st.title('Telecom User Overview and Engagement Analysis Dashboard')
 
-# Sidebar options
-st.sidebar.header('Telecom User Engagement Dashboard')
-selected_metric = st.sidebar.selectbox("Select Engagement Metric", ['Session Frequency', 'Session Duration', 'Total Traffic (DL+UL)'])
+# Data Preprocessing
+# Handle missing values by replacing with the mean
+# df.fillna(df.mean(), inplace=True)
+# Select only numeric columns
+numeric_cols = df.select_dtypes(include=['float64', 'int64']).columns
 
-# Header
-st.title('Telecom User Engagement and Experience Dashboard')
+non_numeric_cols = df.select_dtypes(exclude=['float64', 'int64']).columns
 
-# Main KPIs
-total_sessions = df['session_count'].sum()
-avg_duration = df['session_duration'].mean()
-total_traffic = df['total_traffic'].sum()
+# Replace missing values in non-numeric columns with the mode (most frequent value)
+df[non_numeric_cols] = df[non_numeric_cols].fillna(df[non_numeric_cols].mode().iloc[0])
 
-st.write("### Key Performance Indicators (KPIs)")
-st.metric(label="Total Sessions", value=total_sessions)
-st.metric(label="Average Session Duration (s)", value=round(avg_duration, 2))
-st.metric(label="Total Traffic (DL + UL) in Bytes", value=total_traffic)
+# Replace missing values in numeric columns with the mean
+df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].mean())
+print(df[numeric_cols].head())
+numeric_cols = df.select_dtypes(include=['float64', 'int64'])
 
-# Plot based on the selected engagement metric
-if selected_metric == 'Session Frequency':
-    top_customers_session = df.groupby('MSISDN')['session_count'].sum().nlargest(10).reset_index()
-    fig = px.bar(top_customers_session, x='MSISDN', y='session_count', title="Top 10 Users by Session Frequency")
-    st.plotly_chart(fig)
+Q1 = numeric_cols.quantile(0.25)
+Q3 = numeric_cols.quantile(0.75)
+IQR = Q3 - Q1
 
-elif selected_metric == 'Session Duration':
-    top_customers_duration = df.groupby('MSISDN')['session_duration'].sum().nlargest(10).reset_index()
-    fig = px.bar(top_customers_duration, x='MSISDN', y='session_duration', title="Top 10 Users by Session Duration")
-    st.plotly_chart(fig)
+# Filter out rows with outliers (values below Q1 - 1.5*IQR or above Q3 + 1.5*IQR)
+df_filtered = df[~((numeric_cols < (Q1 - 1.5 * IQR)) | (numeric_cols > (Q3 + 1.5 * IQR))).any(axis=1)]
 
-elif selected_metric == 'Total Traffic (DL+UL)':
-    df['total_traffic'] = df['total_download'] + df['total_upload']
-    top_customers_traffic = df.groupby('MSISDN')['total_traffic'].sum().nlargest(10).reset_index()
-    fig = px.bar(top_customers_traffic, x='MSISDN', y='total_traffic', title="Top 10 Users by Total Traffic")
-    st.plotly_chart(fig)
+# df.fillna(df.mean(), inplace=True)
 
-# Display application traffic
-st.write("### Application Usage (Top 3 Most Used Applications)")
-app_usage = df[['social_media_traffic', 'youtube_traffic', 'netflix_traffic', 'gaming_traffic']].sum().reset_index()
-app_usage.columns = ['Application', 'Traffic']
-fig_app_usage = px.pie(app_usage, names='Application', values='Traffic', title="Traffic Distribution by Application")
-st.plotly_chart(fig_app_usage)
 
-# Clustering - K-means clustering for user segmentation based on engagement metrics
-st.write("### Customer Segmentation Using K-means Clustering")
+# Aggregating metrics for engagement analysis
+engagement_metrics = df.groupby('MSISDN/Number').agg(
+    session_frequency=('Bearer Id', 'count'),
+    session_duration=('Dur. (ms)', 'sum'),
+    total_traffic=('Total DL (Bytes)', 'sum')
+)
 
-# Normalize data and run K-means
-engagement_metrics = df[['session_count', 'session_duration', 'total_traffic']]
+# User Overview: Top 10 Handsets
+top_10_handsets = df['Handset Type'].value_counts().head(10)
+st.subheader('Top 10 Handsets Used by Customers')
+st.bar_chart(top_10_handsets)
+
+# Engagement Analysis: Top 10 Customers by Session Count
+top_10_sessions = engagement_metrics['session_frequency'].nlargest(10)
+st.subheader('Top 10 Customers by Session Count')
+st.bar_chart(top_10_sessions)
+
+# Engagement Analysis: Top 10 Customers by Total Traffic
+top_10_traffic = engagement_metrics['total_traffic'].nlargest(10)
+st.subheader('Top 10 Customers by Total Traffic (Download + Upload)')
+st.bar_chart(top_10_traffic)
+
+# Network Performance: TCP retransmission, RTT, Throughput
+network_performance = df.groupby('MSISDN/Number').agg(
+    avg_tcp_retransmission=('TCP DL Retrans. Vol (Bytes)', 'mean'),
+    avg_rtt=('Avg RTT DL (ms)', 'mean'),
+    avg_throughput=('Avg Bearer TP DL (kbps)', 'mean')
+)
+
+# Visualization of Average Throughput per Handset Type
+st.subheader('Average Throughput per Handset Type')
+handset_throughput = df.groupby('Handset Type')['Avg Bearer TP DL (kbps)'].mean().sort_values(ascending=False).head(10)
+st.bar_chart(handset_throughput)
+
+# Clustering users into engagement clusters using K-means (k=3)
 scaler = StandardScaler()
 engagement_metrics_scaled = scaler.fit_transform(engagement_metrics)
 
 kmeans = KMeans(n_clusters=3, random_state=42)
-clusters = kmeans.fit_predict(engagement_metrics_scaled)
+engagement_metrics['cluster'] = kmeans.fit_predict(engagement_metrics_scaled)
 
-# Add cluster labels to the dataframe
-df['cluster'] = clusters
+# Visualizing clusters
+st.subheader('User Engagement Clusters (K-Means Clustering)')
+fig, ax = plt.subplots()
+sns.scatterplot(
+    x=engagement_metrics['session_duration'], y=engagement_metrics['total_traffic'],
+    hue=engagement_metrics['cluster'], palette='viridis', ax=ax
+)
+ax.set_xlabel('Session Duration (s)')
+ax.set_ylabel('Total Traffic (Bytes)')
+st.pyplot(fig)
 
-# Visualize clusters
-fig_cluster = px.scatter_3d(df, x='session_count', y='session_duration', z='total_traffic', color='cluster',
-                            title="3D Scatter Plot of Customer Segments Based on Engagement Metrics")
-st.plotly_chart(fig_cluster)
+# Elbow Method for Optimal K
+st.subheader('Elbow Method for Optimal K in Clustering')
+inertia = []
+K = range(1, 10)
+for k in K:
+    kmeans = KMeans(n_clusters=k, random_state=42).fit(engagement_metrics_scaled)
+    inertia.append(kmeans.inertia_)
 
-# Clustering details
-cluster_summary = df.groupby('cluster')[['session_count', 'session_duration', 'total_traffic']].agg(['min', 'max', 'mean', 'sum'])
-st.write("### Cluster Summary")
-st.write(cluster_summary)
+fig, ax = plt.subplots()
+ax.plot(K, inertia, 'bx-')
+ax.set_xlabel('Number of clusters (k)')
+ax.set_ylabel('Inertia')
+ax.set_title('Elbow Method for Optimal K')
+st.pyplot(fig)
 
-# Throughput per handset type
-st.write("### Average Throughput per Handset Type")
-throughput_per_handset = df.groupby('Handset Type')['throughput'].mean().reset_index()
-fig_throughput = px.bar(throughput_per_handset, x='Handset Type', y='throughput', title="Average Throughput per Handset Type", height=600)
-st.plotly_chart(fig_throughput)
+# Network Performance: Clustering based on user experience
+network_metrics_scaled = scaler.fit_transform(network_performance)
+kmeans_network = KMeans(n_clusters=3, random_state=42)
+network_performance['experience_cluster'] = kmeans_network.fit_predict(network_metrics_scaled)
 
-# TCP Retransmission per handset type
-st.write("### Average TCP Retransmission per Handset Type")
-tcp_per_handset = df.groupby('Handset Type')['tcp_retransmission'].mean().reset_index()
-fig_tcp = px.bar(tcp_per_handset, x='Handset Type', y='tcp_retransmission', title="Average TCP Retransmission per Handset Type", height=600)
-st.plotly_chart(fig_tcp)
+# Visualize clusters based on TCP retransmission and Throughput
+st.subheader('User Experience Clusters (K-Means Clustering)')
+fig, ax = plt.subplots()
+sns.scatterplot(
+    x=network_performance['avg_tcp_retransmission'], y=network_performance['avg_throughput'],
+    hue=network_performance['experience_cluster'], palette='coolwarm', ax=ax
+)
+ax.set_xlabel('Average TCP Retransmission (Bytes)')
+ax.set_ylabel('Average Throughput (kbps)')
+st.pyplot(fig)
 
-# Streamlit app footer
-st.write("Dashboard created using Streamlit and Plotly for Telecom User Engagement and Experience Analysis.")
+# User Satisfaction: Analyzing satisfaction based on throughput
+st.subheader('User Satisfaction: Throughput vs Handset Type')
+handset_throughput_satisfaction = df.groupby('Handset Type')['Avg Bearer TP DL (kbps)'].mean().sort_values(ascending=False).head(10)
+fig, ax = plt.subplots()
+handset_throughput_satisfaction.plot(kind='bar', ax=ax)
+ax.set_xlabel('Handset Type')
+ax.set_ylabel('Average Throughput (kbps)')
+ax.set_title('Average Throughput by Handset Type')
+st.pyplot(fig)
